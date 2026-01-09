@@ -87,6 +87,7 @@ const checkIn = async (req, res) => {
     // Upload photo to Supabase Storage
     const fileExt = photo.originalname.split('.').pop();
     const fileName = `${userId}/${today}/check-in-${uuidv4()}.${fileExt}`;
+
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('attendance-photos')
       .upload(fileName, photo.buffer, {
@@ -238,6 +239,7 @@ const checkOut = async (req, res) => {
     // Upload photo to Supabase Storage
     const fileExt = photo.originalname.split('.').pop();
     const fileName = `${userId}/${today}/check-out-${uuidv4()}.${fileExt}`;
+
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('attendance-photos')
       .upload(fileName, photo.buffer, {
