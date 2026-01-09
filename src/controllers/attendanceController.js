@@ -1,5 +1,5 @@
-const { supabase } = require('../config/supabase');
-const { ATTENDANCE_STATUS, OFFICE_LOCATION } = require('../config/constants');
+﻿const { supabase } = require('../config/supabase');
+const { ATTENDANCE_STATUS } = require('../config/constants');
 const { isWithinRadius } = require('../utils/location');
 const { isLateCheckIn, isEarlyCheckOut, getTodayDate } = require('../utils/time');
 const { v4: uuidv4 } = require('uuid');
@@ -31,8 +31,26 @@ const checkIn = async (req, res) => {
     const userLat = parseFloat(latitude);
     const userLon = parseFloat(longitude);
 
+    // Get active office location from database
+    const { data: officeLocation, error: officeError } = await supabase
+      .from('office_location')
+      .select('*')
+      .eq('is_active', true)
+      .single();
+
+    if (officeError || !officeLocation) {
+      return res.status(500).json({
+        success: false,
+        error: 'Office location not configured',
+      });
+    }
+
     // Validate location
-    if (!isWithinRadius(userLat, userLon, OFFICE_LOCATION.LATITUDE, OFFICE_LOCATION.LONGITUDE, OFFICE_LOCATION.RADIUS)) {
+    const officeLat = parseFloat(officeLocation.latitude);
+    const officeLon = parseFloat(officeLocation.longitude);
+    const officeRadius = parseInt(officeLocation.radius);
+
+    if (!isWithinRadius(userLat, userLon, officeLat, officeLon, officeRadius)) {
       return res.status(400).json({
         success: false,
         error: 'You are not within the office area',
@@ -69,7 +87,6 @@ const checkIn = async (req, res) => {
     // Upload photo to Supabase Storage
     const fileExt = photo.originalname.split('.').pop();
     const fileName = `${userId}/${today}/check-in-${uuidv4()}.${fileExt}`;
-    
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('attendance-photos')
       .upload(fileName, photo.buffer, {
@@ -158,8 +175,26 @@ const checkOut = async (req, res) => {
     const userLat = parseFloat(latitude);
     const userLon = parseFloat(longitude);
 
+    // Get active office location from database
+    const { data: officeLocation, error: officeError } = await supabase
+      .from('office_location')
+      .select('*')
+      .eq('is_active', true)
+      .single();
+
+    if (officeError || !officeLocation) {
+      return res.status(500).json({
+        success: false,
+        error: 'Office location not configured',
+      });
+    }
+
     // Validate location
-    if (!isWithinRadius(userLat, userLon, OFFICE_LOCATION.LATITUDE, OFFICE_LOCATION.LONGITUDE, OFFICE_LOCATION.RADIUS)) {
+    const officeLat = parseFloat(officeLocation.latitude);
+    const officeLon = parseFloat(officeLocation.longitude);
+    const officeRadius = parseInt(officeLocation.radius);
+
+    if (!isWithinRadius(userLat, userLon, officeLat, officeLon, officeRadius)) {
       return res.status(400).json({
         success: false,
         error: 'You are not within the office area',
@@ -203,7 +238,6 @@ const checkOut = async (req, res) => {
     // Upload photo to Supabase Storage
     const fileExt = photo.originalname.split('.').pop();
     const fileName = `${userId}/${today}/check-out-${uuidv4()}.${fileExt}`;
-    
     const { data: uploadData, error: uploadError } = await supabase.storage
       .from('attendance-photos')
       .upload(fileName, photo.buffer, {
