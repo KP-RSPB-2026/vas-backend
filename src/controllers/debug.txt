@@ -1,0 +1,14 @@
+﻿const checkIn = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { latitude, longitude, reason } = req.body;
+    const photo = req.file;
+
+    console.log('Check-in request received:');
+    console.log('- userId:', userId);
+    console.log('- latitude:', latitude);
+    console.log('- longitude:', longitude);
+    console.log('- reason:', reason);
+    console.log('- photo:', photo ? 'Yes' : 'No');
+    console.log('- req.body:', req.body);
+    console.log('- req.file:', req.file);
