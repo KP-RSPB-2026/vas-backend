@@ -1,7 +1,7 @@
 ﻿const { supabase } = require('../config/supabase');
 const { ATTENDANCE_STATUS } = require('../config/constants');
 const { isWithinRadius } = require('../utils/location');
-const { isLateCheckIn, isEarlyCheckOut, getTodayDate } = require('../utils/time');
+const { getCurrentTimeGMT8, isLateCheckIn, isEarlyCheckOut, getTodayDate } = require('../utils/time');
 const { v4: uuidv4 } = require('uuid');
 
 /**
@@ -57,7 +57,7 @@ const checkIn = async (req, res) => {
       });
     }
 
-    // Check if already checked in today
+    // Check if already checked in today (using GMT+8 date)
     const today = getTodayDate();
     const { data: existingAttendance } = await supabase
       .from('attendances')
@@ -73,7 +73,8 @@ const checkIn = async (req, res) => {
       });
     }
 
-    const now = new Date();
+    // Use server time in GMT+8 timezone - CANNOT BE MANIPULATED BY CLIENT!
+    const now = getCurrentTimeGMT8().toDate();
     const isLate = isLateCheckIn(now);
 
     // Validate reason if late
@@ -225,7 +226,8 @@ const checkOut = async (req, res) => {
       });
     }
 
-    const now = new Date();
+    // Use server time in GMT+8 timezone - CANNOT BE MANIPULATED BY CLIENT!
+    const now = getCurrentTimeGMT8().toDate();
     const isEarly = isEarlyCheckOut(now);
 
     // Validate reason if early

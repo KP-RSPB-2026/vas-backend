@@ -15,7 +15,12 @@ for (const envVar of requiredEnvVars) {
 // Create Supabase client
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_ANON_KEY,
+  {
+    auth: {
+      persistSession: false,
+    }
+  }
 );
 
 // Create Supabase admin client (with service role key)
