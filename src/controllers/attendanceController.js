@@ -1,7 +1,8 @@
-﻿const { supabase } = require('../config/supabase');
+﻿const { supabase, supabaseAdmin } = require('../config/supabase');
 const { ATTENDANCE_STATUS } = require('../config/constants');
 const { isWithinRadius } = require('../utils/location');
-const { getCurrentTimeGMT8, isLateCheckIn, isEarlyCheckOut, getTodayDate } = require('../utils/time');
+const { getCurrentTimeGMT8, isLateCheckIn, isEarlyCheckOut, getTodayDate, TIMEZONE } = require('../utils/time');
+const moment = require('moment-timezone');
 const { v4: uuidv4 } = require('uuid');
 
 /**
@@ -317,17 +318,39 @@ const checkOut = async (req, res) => {
 const getHistory = async (req, res) => {
   try {
     const userId = req.user.role === 'admin' ? req.query.user_id : req.user.id;
-    const { limit = 30, offset = 0 } = req.query;
+    // Support both offset-based and page-based pagination for compatibility
+    const limit = Number(req.query.limit ?? 30);
+    const page = req.query.page ? Number(req.query.page) : undefined;
+    const rawOffset = req.query.offset ? Number(req.query.offset) : undefined;
+    const offset = rawOffset ?? ((page && page > 0 ? (page - 1) * limit : 0));
 
+    const month = req.query.month ? Number(req.query.month) : undefined; // 1-12
+    const year = req.query.year ? Number(req.query.year) : undefined;
+    const includePhotos = req.query.include_photos !== 'false';
+
+    // Build base query
     let query = supabase
       .from('attendances')
       .select('*')
-      .order('date', { ascending: false })
-      .range(offset, offset + limit - 1);
+      .order('date', { ascending: false });
 
     if (userId) {
       query = query.eq('user_id', userId);
     }
+
+    // Month/year filtering using GMT+8 (same timezone used to store `date`)
+    if (month && year) {
+      const start = moment.tz({ year, month: month - 1, day: 1 }, TIMEZONE)
+        .startOf('month')
+        .format('YYYY-MM-DD');
+      const end = moment.tz({ year, month: month - 1, day: 1 }, TIMEZONE)
+        .endOf('month')
+        .format('YYYY-MM-DD');
+      query = query.gte('date', start).lte('date', end);
+    }
+
+    // Apply pagination range
+    query = query.range(offset, offset + limit - 1);
 
     const { data: attendances, error } = await query;
 
@@ -339,9 +362,86 @@ const getHistory = async (req, res) => {
       });
     }
 
+    // Optionally sign photo URLs (works even if bucket is private)
+    async function signUrlIfPossible(publicUrl) {
+      try {
+        if (!publicUrl) return null;
+        const marker = '/storage/v1/object/public/attendance-photos/';
+        const idx = publicUrl.indexOf(marker);
+        if (idx === -1) return publicUrl; // not a public URL we recognize
+        const path = publicUrl.substring(idx + marker.length);
+        const client = supabaseAdmin ?? supabase;
+        const { data: signed, error: signErr } = await client
+          .storage
+          .from('attendance-photos')
+          .createSignedUrl(path, 60 * 60 * 24); // 24h
+        if (signErr || !signed) return publicUrl;
+        return signed.signedUrl;
+      } catch (_) {
+        return publicUrl;
+      }
+    }
+
+    const withSignedUrls = includePhotos
+      ? await Promise.all((attendances || []).map(async (row) => {
+          const isLateFlag = row.check_in_time ? isLateCheckIn(row.check_in_time) : false;
+          const isEarlyFlag = row.check_out_time ? isEarlyCheckOut(row.check_out_time) : false;
+          return {
+            ...row,
+            check_in_photo_url: await signUrlIfPossible(row.check_in_photo_url),
+            check_out_photo_url: await signUrlIfPossible(row.check_out_photo_url),
+            is_late_check_in: isLateFlag,
+            is_early_check_out: isEarlyFlag,
+          };
+        }))
+      : (attendances || []).map((row) => {
+          const isLateFlag = row.check_in_time ? isLateCheckIn(row.check_in_time) : false;
+          const isEarlyFlag = row.check_out_time ? isEarlyCheckOut(row.check_out_time) : false;
+          return {
+            ...row,
+            check_in_photo_url: null,
+            check_out_photo_url: null,
+            is_late_check_in: isLateFlag,
+            is_early_check_out: isEarlyFlag,
+          };
+        });
+
+    // Fetch total count for hasMore calculation (same filters)
+    let countQuery = supabase
+      .from('attendances')
+      .select('*', { count: 'exact', head: true });
+    if (userId) {
+      countQuery = countQuery.eq('user_id', userId);
+    }
+    if (month && year) {
+      const start = moment.tz({ year, month: month - 1, day: 1 }, TIMEZONE)
+        .startOf('month')
+        .format('YYYY-MM-DD');
+      const end = moment.tz({ year, month: month - 1, day: 1 }, TIMEZONE)
+        .endOf('month')
+        .format('YYYY-MM-DD');
+      countQuery = countQuery.gte('date', start).lte('date', end);
+    }
+    const { count, error: countError } = await countQuery;
+    if (countError) {
+      console.warn('Count history warning:', countError);
+    }
+
+    const total = typeof count === 'number' ? count : undefined;
+    const hasMore = total != null ? offset + withSignedUrls.length < total : withSignedUrls.length === limit;
+
     return res.status(200).json({
       success: true,
-      data: attendances,
+      data: withSignedUrls,
+      meta: {
+        page: page ?? (rawOffset != null ? Math.floor(rawOffset / limit) + 1 : 1),
+        limit,
+        offset,
+        total,
+        hasMore,
+        month,
+        year,
+      },
     });
   } catch (error) {
     console.error('Get history error:', error);
@@ -382,9 +482,37 @@ const getDetail = async (req, res) => {
       });
     }
 
+    // Sign photo URLs for detail response as well (24h)
+    async function signUrlIfPossible(publicUrl) {
+      try {
+        if (!publicUrl) return null;
+        const marker = '/storage/v1/object/public/attendance-photos/';
+        const idx = publicUrl.indexOf(marker);
+        if (idx === -1) return publicUrl;
+        const path = publicUrl.substring(idx + marker.length);
+        const client = supabaseAdmin ?? supabase;
+        const { data: signed, error: signErr } = await client
+          .storage
+          .from('attendance-photos')
+          .createSignedUrl(path, 60 * 60 * 24);
+        if (signErr || !signed) return publicUrl;
+        return signed.signedUrl;
+      } catch (_) {
+        return publicUrl;
+      }
+    }
+
+    const mapped = {
+      ...attendance,
+      check_in_photo_url: await signUrlIfPossible(attendance.check_in_photo_url),
+      check_out_photo_url: await signUrlIfPossible(attendance.check_out_photo_url),
+      is_late_check_in: attendance.check_in_time ? isLateCheckIn(attendance.check_in_time) : false,
+      is_early_check_out: attendance.check_out_time ? isEarlyCheckOut(attendance.check_out_time) : false,
+    };
+
     return res.status(200).json({
       success: true,
-      data: attendance,
+      data: mapped,
     });
   } catch (error) {
     console.error('Get detail error:', error);

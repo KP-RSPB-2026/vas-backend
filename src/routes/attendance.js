@@ -26,7 +26,10 @@ router.post('/check-out', authenticate, upload.single('photo'), checkOut);
  * @route   GET /api/attendance/history
  * @desc    Get attendance history
  * @access  Private (User: own history, Admin: all)
- * @query   user_id (admin only), limit, offset
+ * @query   user_id (admin only), limit, offset, page, month, year
+ *          - Pagination: use either offset+limit or page+limit
+ *          - Filtering: when month (1-12) and year provided, results are
+ *            constrained to that month in GMT+8 using the stored `date` field
  */
 router.get('/history', authenticate, getHistory);
 

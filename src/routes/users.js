@@ -8,6 +8,8 @@ const { authenticate, requireAdmin } = require('../middleware/auth');
  * @desc    Get all users
  * @access  Private (Admin only)
  * @query   role (optional filter)
+ * @query   search (optional, fuzzy match on name)
+ * @query   page, limit (pagination)
  */
 router.get('/', authenticate, requireAdmin, getAllUsers);
 

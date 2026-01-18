@@ -12,10 +12,15 @@ const app = express();
 app.use(helmet());
 
 // Rate limiting
+const isDev = process.env.NODE_ENV !== 'production';
+const devWhitelistedIps = ['127.0.0.1', '::1', '10.0.2.2'];
+
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  max: isDev ? 0 : 100, // 0 disables in dev
   message: 'Too many requests from this IP, please try again later.',
+  keyGenerator: (req) => (req.user?.id ? `user:${req.user.id}` : req.ip),
+  skip: (req) => isDev || devWhitelistedIps.includes(req.ip),
 });
 app.use('/api/', limiter);
 
