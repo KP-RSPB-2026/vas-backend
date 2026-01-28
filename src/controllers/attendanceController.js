@@ -1,9 +1,25 @@
-﻿const { supabase, supabaseAdmin } = require('../config/supabase');
+﻿const path = require('path');
+const fs = require('fs/promises');
+const pool = require('../config/db');
 const { ATTENDANCE_STATUS } = require('../config/constants');
 const { isWithinRadius } = require('../utils/location');
-const { getCurrentTimeGMT8, isLateCheckIn, isEarlyCheckOut, getTodayDate, TIMEZONE } = require('../utils/time');
-const moment = require('moment-timezone');
-const { v4: uuidv4 } = require('uuid');
+const { getCurrentTimeGMT8, isLateCheckIn, isEarlyCheckOut, getTodayDate } = require('../utils/time');
+
+async function getActiveOfficeLocation() {
+  const [rows] = await pool.execute('SELECT latitude, longitude, radius FROM office_location WHERE is_active = 1 LIMIT 1');
+  return rows[0];
+}
+
+async function savePhoto(file, userId, date, label) {
+  const ext = path.extname(file.originalname || '') || '.jpg';
+  const dir = path.join(__dirname, '..', '..', 'uploads', String(userId), date);
+  await fs.mkdir(dir, { recursive: true });
+  const filename = `${label}-${Date.now()}${ext}`;
+  const filepath = path.join(dir, filename);
+  await fs.writeFile(filepath, file.buffer);
+  const publicPath = `/uploads/${userId}/${date}/${filename}`;
+  return { filepath, publicPath };
+}
 
 /**
  * Check-in attendance
@@ -32,21 +48,11 @@ const checkIn = async (req, res) => {
     const userLat = parseFloat(latitude);
     const userLon = parseFloat(longitude);
 
-    // Get active office location from database
-    const { data: officeLocation, error: officeError } = await supabase
-      .from('office_location')
-      .select('*')
-      .eq('is_active', true)
-      .single();
-
-    if (officeError || !officeLocation) {
-      return res.status(500).json({
-        success: false,
-        error: 'Office location not configured',
-      });
+    const officeLocation = await getActiveOfficeLocation();
+    if (!officeLocation) {
+      return res.status(500).json({ success: false, error: 'Office location not configured' });
     }
 
-    // Validate location
     const officeLat = parseFloat(officeLocation.latitude);
     const officeLon = parseFloat(officeLocation.longitude);
     const officeRadius = parseInt(officeLocation.radius);
@@ -58,20 +64,14 @@ const checkIn = async (req, res) => {
       });
     }
 
-    // Check if already checked in today (using GMT+8 date)
     const today = getTodayDate();
-    const { data: existingAttendance } = await supabase
-      .from('attendances')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('date', today)
-      .single();
+    const [existingRows] = await pool.execute(
+      'SELECT id FROM attendance WHERE user_id = ? AND date = ? LIMIT 1',
+      [userId, today]
+    );
 
-    if (existingAttendance) {
-      return res.status(400).json({
-        success: false,
-        error: 'Already checked in today',
-      });
+    if (existingRows.length) {
+      return res.status(400).json({ success: false, error: 'Already checked in today' });
     }
 
     // Use server time in GMT+8 timezone - CANNOT BE MANIPULATED BY CLIENT!
@@ -86,53 +86,19 @@ const checkIn = async (req, res) => {
       });
     }
 
-    // Upload photo to Supabase Storage
-    const fileExt = photo.originalname.split('.').pop();
-    const fileName = `${userId}/${today}/check-in-${uuidv4()}.${fileExt}`;
+    const saved = await savePhoto(photo, userId, today, 'check-in');
+    const status = isLate ? ATTENDANCE_STATUS.LATE : ATTENDANCE_STATUS.CHECKED_IN;
 
-    const { data: uploadData, error: uploadError } = await supabase.storage
-      .from('attendance-photos')
-      .upload(fileName, photo.buffer, {
-        contentType: photo.mimetype,
-        upsert: false,
-      });
+    const [insertResult] = await pool.execute(
+      `INSERT INTO attendance
+        (user_id, date, status, check_in_time, check_in_photo_url, check_in_latitude, check_in_longitude, check_in_reason, is_late, is_early)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      [userId, today, status, now, saved.publicPath, userLat, userLon, isLate ? reason : null, isLate ? 1 : 0]
+    );
 
-    if (uploadError) {
-      console.error('Photo upload error:', uploadError);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to upload photo',
-      });
-    }
-
-    // Get public URL
-    const { data: { publicUrl } } = supabase.storage
-      .from('attendance-photos')
-      .getPublicUrl(fileName);
-
-    // Insert attendance record
-    const { data: attendance, error: insertError } = await supabase
-      .from('attendances')
-      .insert({
-        user_id: userId,
-        check_in_time: now.toISOString(),
-        check_in_photo_url: publicUrl,
-        check_in_latitude: userLat,
-        check_in_longitude: userLon,
-        check_in_reason: isLate ? reason : null,
-        status: isLate ? ATTENDANCE_STATUS.LATE : ATTENDANCE_STATUS.CHECKED_IN,
-        date: today,
-      })
-      .select()
-      .single();
-
-    if (insertError) {
-      console.error('Insert attendance error:', insertError);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to create attendance record',
-      });
-    }
+    const insertedId = insertResult.insertId;
+    const [attendanceRows] = await pool.execute('SELECT * FROM attendance WHERE id = ?', [insertedId]);
+    const attendance = attendanceRows[0];
 
     return res.status(201).json({
       success: true,
@@ -178,21 +144,11 @@ const checkOut = async (req, res) => {
     const userLat = parseFloat(latitude);
     const userLon = parseFloat(longitude);
 
-    // Get active office location from database
-    const { data: officeLocation, error: officeError } = await supabase
-      .from('office_location')
-      .select('*')
-      .eq('is_active', true)
-      .single();
-
-    if (officeError || !officeLocation) {
-      return res.status(500).json({
-        success: false,
-        error: 'Office location not configured',
-      });
+    const officeLocation = await getActiveOfficeLocation();
+    if (!officeLocation) {
+      return res.status(500).json({ success: false, error: 'Office location not configured' });
     }
 
-    // Validate location
     const officeLat = parseFloat(officeLocation.latitude);
     const officeLon = parseFloat(officeLocation.longitude);
     const officeRadius = parseInt(officeLocation.radius);
@@ -204,27 +160,19 @@ const checkOut = async (req, res) => {
       });
     }
 
-    // Get today's attendance
     const today = getTodayDate();
-    const { data: attendance, error: fetchError } = await supabase
-      .from('attendances')
-      .select('*')
-      .eq('user_id', userId)
-      .eq('date', today)
-      .single();
+    const [attendanceRows] = await pool.execute(
+      'SELECT * FROM attendance WHERE user_id = ? AND date = ? LIMIT 1',
+      [userId, today]
+    );
 
-    if (fetchError || !attendance) {
-      return res.status(400).json({
-        success: false,
-        error: 'No check-in record found for today',
-      });
+    const attendance = attendanceRows[0];
+    if (!attendance) {
+      return res.status(400).json({ success: false, error: 'No check-in record found for today' });
     }
 
     if (attendance.check_out_time) {
-      return res.status(400).json({
-        success: false,
-        error: 'Already checked out today',
-      });
+      return res.status(400).json({ success: false, error: 'Already checked out today' });
     }
 
     // Use server time in GMT+8 timezone - CANNOT BE MANIPULATED BY CLIENT!
@@ -239,61 +187,36 @@ const checkOut = async (req, res) => {
       });
     }
 
-    // Upload photo to Supabase Storage
-    const fileExt = photo.originalname.split('.').pop();
-    const fileName = `${userId}/${today}/check-out-${uuidv4()}.${fileExt}`;
+    const saved = await savePhoto(photo, userId, today, 'check-out');
 
-    const { data: uploadData, error: uploadError } = await supabase.storage
-      .from('attendance-photos')
-      .upload(fileName, photo.buffer, {
-        contentType: photo.mimetype,
-        upsert: false,
-      });
-
-    if (uploadError) {
-      console.error('Photo upload error:', uploadError);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to upload photo',
-      });
-    }
-
-    // Get public URL
-    const { data: { publicUrl } } = supabase.storage
-      .from('attendance-photos')
-      .getPublicUrl(fileName);
-
-    // Determine final status
     let finalStatus = ATTENDANCE_STATUS.COMPLETED;
-    if (attendance.status === ATTENDANCE_STATUS.LATE) {
-      finalStatus = ATTENDANCE_STATUS.LATE; // Keep late status
-    }
-    if (isEarly) {
-      finalStatus = ATTENDANCE_STATUS.EARLY_LEAVE;
-    }
+    if (attendance.status === ATTENDANCE_STATUS.LATE) finalStatus = ATTENDANCE_STATUS.LATE;
+    if (isEarly) finalStatus = ATTENDANCE_STATUS.EARLY_LEAVE;
 
-    // Update attendance record
-    const { data: updatedAttendance, error: updateError } = await supabase
-      .from('attendances')
-      .update({
-        check_out_time: now.toISOString(),
-        check_out_photo_url: publicUrl,
-        check_out_latitude: userLat,
-        check_out_longitude: userLon,
-        check_out_reason: isEarly ? reason : null,
-        status: finalStatus,
-      })
-      .eq('id', attendance.id)
-      .select()
-      .single();
+    await pool.execute(
+      `UPDATE attendance SET
+        check_out_time = ?,
+        check_out_photo_url = ?,
+        check_out_latitude = ?,
+        check_out_longitude = ?,
+        check_out_reason = ?,
+        status = ?,
+        is_early = ?
+       WHERE id = ?`,
+      [
+        now,
+        saved.publicPath,
+        userLat,
+        userLon,
+        isEarly ? reason : null,
+        finalStatus,
+        isEarly ? 1 : 0,
+        attendance.id,
+      ]
+    );
 
-    if (updateError) {
-      console.error('Update attendance error:', updateError);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to update attendance record',
-      });
-    }
+    const [updatedRows] = await pool.execute('SELECT * FROM attendance WHERE id = ?', [attendance.id]);
+    const updatedAttendance = updatedRows[0];
 
     return res.status(200).json({
       success: true,
@@ -318,125 +241,77 @@ const checkOut = async (req, res) => {
 const getHistory = async (req, res) => {
   try {
     const userId = req.user.role === 'admin' ? req.query.user_id : req.user.id;
-    // Support both offset-based and page-based pagination for compatibility
-    const limit = Number(req.query.limit ?? 30);
-    const page = req.query.page ? Number(req.query.page) : undefined;
-    const rawOffset = req.query.offset ? Number(req.query.offset) : undefined;
-    const offset = rawOffset ?? ((page && page > 0 ? (page - 1) * limit : 0));
 
-    const month = req.query.month ? Number(req.query.month) : undefined; // 1-12
-    const year = req.query.year ? Number(req.query.year) : undefined;
+    // Coerce numbers safely to avoid NaN/undefined reaching the query placeholders
+    const parsedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 30;
+
+    const parsedPage = parseInt(req.query.page, 10);
+    const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : undefined;
+
+    const parsedOffset = parseInt(req.query.offset, 10);
+    const offset = Number.isFinite(parsedOffset)
+      ? parsedOffset
+      : (page ? (page - 1) * limit : 0);
+
+    const parsedMonth = parseInt(req.query.month, 10);
+    const parsedYear = parseInt(req.query.year, 10);
+    const month = Number.isFinite(parsedMonth) ? parsedMonth : undefined;
+    const year = Number.isFinite(parsedYear) ? parsedYear : undefined;
+
     const includePhotos = req.query.include_photos !== 'false';
 
-    // Build base query
-    let query = supabase
-      .from('attendances')
-      .select('*')
-      .order('date', { ascending: false });
-
+    const filters = [];
+    const params = [];
     if (userId) {
-      query = query.eq('user_id', userId);
+      filters.push('user_id = ?');
+      params.push(userId);
+    }
+    if (month !== undefined && year !== undefined) {
+      filters.push('MONTH(date) = ? AND YEAR(date) = ?');
+      params.push(month, year);
     }
 
-    // Month/year filtering using GMT+8 (same timezone used to store `date`)
-    if (month && year) {
-      const start = moment.tz({ year, month: month - 1, day: 1 }, TIMEZONE)
-        .startOf('month')
-        .format('YYYY-MM-DD');
-      const end = moment.tz({ year, month: month - 1, day: 1 }, TIMEZONE)
-        .endOf('month')
-        .format('YYYY-MM-DD');
-      query = query.gte('date', start).lte('date', end);
-    }
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
 
-    // Apply pagination range
-    query = query.range(offset, offset + limit - 1);
+    // Guard: LIMIT/OFFSET must be non-negative integers
+    const safeLimit = limit < 0 ? 30 : limit;
+    const safeOffset = offset < 0 ? 0 : offset;
 
-    const { data: attendances, error } = await query;
+    const sqlParams = [...params];
+    const sql = `SELECT * FROM attendance ${where} ORDER BY date DESC LIMIT ${safeLimit} OFFSET ${safeOffset}`;
+    console.log('getHistory params:', {
+      where,
+      params,
+      safeLimit,
+      safeOffset,
+      sql,
+    });
 
-    if (error) {
-      console.error('Fetch history error:', error);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to fetch attendance history',
-      });
-    }
+    const [rows] = await pool.execute(sql, sqlParams);
 
-    // Optionally sign photo URLs (works even if bucket is private)
-    async function signUrlIfPossible(publicUrl) {
-      try {
-        if (!publicUrl) return null;
-        const marker = '/storage/v1/object/public/attendance-photos/';
-        const idx = publicUrl.indexOf(marker);
-        if (idx === -1) return publicUrl; // not a public URL we recognize
-        const path = publicUrl.substring(idx + marker.length);
-        const client = supabaseAdmin ?? supabase;
-        const { data: signed, error: signErr } = await client
-          .storage
-          .from('attendance-photos')
-          .createSignedUrl(path, 60 * 60 * 24); // 24h
-        if (signErr || !signed) return publicUrl;
-        return signed.signedUrl;
-      } catch (_) {
-        return publicUrl;
-      }
-    }
+    const [countRows] = await pool.execute(
+      `SELECT COUNT(*) AS total FROM attendance ${where}`,
+      params
+    );
+    const total = countRows[0]?.total ?? 0;
+    const hasMore = safeOffset + rows.length < total;
 
-    const withSignedUrls = includePhotos
-      ? await Promise.all((attendances || []).map(async (row) => {
-          const isLateFlag = row.check_in_time ? isLateCheckIn(row.check_in_time) : false;
-          const isEarlyFlag = row.check_out_time ? isEarlyCheckOut(row.check_out_time) : false;
-          return {
-            ...row,
-            check_in_photo_url: await signUrlIfPossible(row.check_in_photo_url),
-            check_out_photo_url: await signUrlIfPossible(row.check_out_photo_url),
-            is_late_check_in: isLateFlag,
-            is_early_check_out: isEarlyFlag,
-          };
-        }))
-      : (attendances || []).map((row) => {
-          const isLateFlag = row.check_in_time ? isLateCheckIn(row.check_in_time) : false;
-          const isEarlyFlag = row.check_out_time ? isEarlyCheckOut(row.check_out_time) : false;
-          return {
-            ...row,
-            check_in_photo_url: null,
-            check_out_photo_url: null,
-            is_late_check_in: isLateFlag,
-            is_early_check_out: isEarlyFlag,
-          };
-        });
-
-    // Fetch total count for hasMore calculation (same filters)
-    let countQuery = supabase
-      .from('attendances')
-      .select('*', { count: 'exact', head: true });
-    if (userId) {
-      countQuery = countQuery.eq('user_id', userId);
-    }
-    if (month && year) {
-      const start = moment.tz({ year, month: month - 1, day: 1 }, TIMEZONE)
-        .startOf('month')
-        .format('YYYY-MM-DD');
-      const end = moment.tz({ year, month: month - 1, day: 1 }, TIMEZONE)
-        .endOf('month')
-        .format('YYYY-MM-DD');
-      countQuery = countQuery.gte('date', start).lte('date', end);
-    }
-    const { count, error: countError } = await countQuery;
-    if (countError) {
-      console.warn('Count history warning:', countError);
-    }
-
-    const total = typeof count === 'number' ? count : undefined;
-    const hasMore = total != null ? offset + withSignedUrls.length < total : withSignedUrls.length === limit;
+    const mapped = rows.map((row) => ({
+      ...row,
+      check_in_photo_url: includePhotos ? row.check_in_photo_url : null,
+      check_out_photo_url: includePhotos ? row.check_out_photo_url : null,
+      is_late_check_in: !!row.is_late,
+      is_early_check_out: !!row.is_early,
+    }));
 
     return res.status(200).json({
       success: true,
-      data: withSignedUrls,
+      data: mapped,
       meta: {
-        page: page ?? (rawOffset != null ? Math.floor(rawOffset / limit) + 1 : 1),
-        limit,
-        offset,
+        page: page ?? (Number.isFinite(parsedOffset) ? Math.floor(parsedOffset / safeLimit) + 1 : 1),
+        limit: safeLimit,
+        offset: safeOffset,
         total,
         hasMore,
         month,
@@ -445,10 +320,7 @@ const getHistory = async (req, res) => {
     });
   } catch (error) {
     console.error('Get history error:', error);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-    });
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 
@@ -461,65 +333,27 @@ const getDetail = async (req, res) => {
     const userId = req.user.id;
     const isAdmin = req.user.role === 'admin';
 
-    const { data: attendance, error } = await supabase
-      .from('attendances')
-      .select('*')
-      .eq('id', id)
-      .single();
+    const [rows] = await pool.execute('SELECT * FROM attendance WHERE id = ?', [id]);
+    const attendance = rows[0];
 
-    if (error || !attendance) {
-      return res.status(404).json({
-        success: false,
-        error: 'Attendance record not found',
-      });
+    if (!attendance) {
+      return res.status(404).json({ success: false, error: 'Attendance record not found' });
     }
 
-    // Check authorization
-    if (!isAdmin && attendance.user_id !== userId) {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied',
-      });
-    }
-
-    // Sign photo URLs for detail response as well (24h)
-    async function signUrlIfPossible(publicUrl) {
-      try {
-        if (!publicUrl) return null;
-        const marker = '/storage/v1/object/public/attendance-photos/';
-        const idx = publicUrl.indexOf(marker);
-        if (idx === -1) return publicUrl;
-        const path = publicUrl.substring(idx + marker.length);
-        const client = supabaseAdmin ?? supabase;
-        const { data: signed, error: signErr } = await client
-          .storage
-          .from('attendance-photos')
-          .createSignedUrl(path, 60 * 60 * 24);
-        if (signErr || !signed) return publicUrl;
-        return signed.signedUrl;
-      } catch (_) {
-        return publicUrl;
-      }
+    if (!isAdmin && String(attendance.user_id) !== String(userId)) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
     }
 
     const mapped = {
       ...attendance,
-      check_in_photo_url: await signUrlIfPossible(attendance.check_in_photo_url),
-      check_out_photo_url: await signUrlIfPossible(attendance.check_out_photo_url),
-      is_late_check_in: attendance.check_in_time ? isLateCheckIn(attendance.check_in_time) : false,
-      is_early_check_out: attendance.check_out_time ? isEarlyCheckOut(attendance.check_out_time) : false,
+      is_late_check_in: !!attendance.is_late,
+      is_early_check_out: !!attendance.is_early,
     };
 
-    return res.status(200).json({
-      success: true,
-      data: mapped,
-    });
+    return res.status(200).json({ success: true, data: mapped });
   } catch (error) {
     console.error('Get detail error:', error);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-    });
+    return res.status(500).json({ success: false, error: 'Internal server error' });
   }
 };
 

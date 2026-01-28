@@ -1,5 +1,10 @@
-const { OFFICE_LOCATION } = require('../config/constants');
 const { isWithinRadius, calculateDistance } = require('../utils/location');
+const pool = require('../config/db');
+
+async function getActiveOfficeLocation() {
+  const [rows] = await pool.execute('SELECT latitude, longitude, radius FROM office_location WHERE is_active = 1 LIMIT 1');
+  return rows[0];
+}
 
 /**
  * Validate if user is within office location
@@ -34,20 +39,24 @@ const validateLocation = async (req, res) => {
       });
     }
 
-    // Check if within radius
+    const office = await getActiveOfficeLocation();
+    if (!office) {
+      return res.status(500).json({ success: false, error: 'Office location not configured' });
+    }
+
     const distance = calculateDistance(
       userLat,
       userLon,
-      OFFICE_LOCATION.LATITUDE,
-      OFFICE_LOCATION.LONGITUDE
+      parseFloat(office.latitude),
+      parseFloat(office.longitude)
     );
 
     const isValid = isWithinRadius(
       userLat,
       userLon,
-      OFFICE_LOCATION.LATITUDE,
-      OFFICE_LOCATION.LONGITUDE,
-      OFFICE_LOCATION.RADIUS
+      parseFloat(office.latitude),
+      parseFloat(office.longitude),
+      parseInt(office.radius)
     );
 
     return res.status(200).json({
@@ -55,10 +64,10 @@ const validateLocation = async (req, res) => {
       data: {
         isValid,
         distance: Math.round(distance), // in meters
-        allowedRadius: OFFICE_LOCATION.RADIUS,
+        allowedRadius: parseInt(office.radius),
         message: isValid 
           ? 'You are within the office area' 
-          : `You are ${Math.round(distance - OFFICE_LOCATION.RADIUS)}m outside the allowed area`,
+          : `You are ${Math.round(distance - office.radius)}m outside the allowed area`,
       },
     });
   } catch (error) {

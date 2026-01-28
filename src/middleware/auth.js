@@ -1,57 +1,40 @@
-const { supabase } = require('../config/supabase');
+const pool = require('../config/db');
+const { verifyAccessToken } = require('../utils/jwt');
 
 /**
- * Middleware to verify JWT token from Supabase Auth
+ * Middleware to verify JWT token
  */
 const authenticate = async (req, res, next) => {
   try {
-    // Get token from Authorization header
     const authHeader = req.headers.authorization;
-    
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        error: 'Missing or invalid authorization header',
-      });
+      return res.status(401).json({ success: false, error: 'Missing or invalid authorization header' });
     }
 
-    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
-
-    // Verify token with Supabase
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-
-    if (error || !user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or expired token',
-      });
+    const token = authHeader.substring(7);
+    let decoded;
+    try {
+      decoded = verifyAccessToken(token);
+    } catch (err) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired token' });
     }
 
-    // Get user details from users table
-    const { data: userData, error: userError } = await supabase
-      .from('users')
-      .select('*')
-      .eq('id', user.id)
-      .single();
-
-    if (userError || !userData) {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found',
-      });
+    const [rows] = await pool.execute('SELECT id, nomor_karyawan, nama AS name, role FROM users WHERE id = ?', [decoded.sub]);
+    if (!rows.length) {
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
 
-    // Attach user to request
-    req.user = userData;
-    req.authUser = user;
-    
+    req.user = {
+      id: String(rows[0].id),
+      nomor_karyawan: rows[0].nomor_karyawan,
+      name: rows[0].name,
+      role: rows[0].role,
+    };
+
     next();
   } catch (error) {
     console.error('Authentication error:', error);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal server error during authentication',
-    });
+    return res.status(500).json({ success: false, error: 'Internal server error during authentication' });
   }
 };
 
@@ -60,10 +43,7 @@ const authenticate = async (req, res, next) => {
  */
 const requireAdmin = (req, res, next) => {
   if (!req.user || req.user.role !== 'admin') {
-    return res.status(403).json({
-      success: false,
-      error: 'Access denied. Admin role required.',
-    });
+    return res.status(403).json({ success: false, error: 'Access denied. Admin role required.' });
   }
   next();
 };

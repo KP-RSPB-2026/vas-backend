@@ -3,6 +3,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const path = require('path');
 const routes = require('./routes');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 
@@ -35,6 +36,9 @@ app.use(cors({
 // Body parser
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Static files for uploaded photos
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // Logging
 if (process.env.NODE_ENV === 'development') {
