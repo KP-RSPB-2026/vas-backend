@@ -3,7 +3,63 @@ const fs = require('fs/promises');
 const pool = require('../config/db');
 const { ATTENDANCE_STATUS } = require('../config/constants');
 const { isWithinRadius } = require('../utils/location');
-const { getCurrentTimeGMT8, isLateCheckIn, isEarlyCheckOut, getTodayDate } = require('../utils/time');
+const { getCurrentTimeGMT8, isLateCheckIn, isEarlyCheckOut, getTodayDate, TIMEZONE } = require('../utils/time');
+const moment = require('moment-timezone');
+
+async function findShift({ shiftId, shiftCode }) {
+  if (!shiftId && !shiftCode) return null;
+  const params = [];
+  const where = [];
+  if (shiftId) {
+    where.push('id = ?');
+    params.push(shiftId);
+  }
+  if (shiftCode) {
+    where.push('code = ?');
+    params.push(shiftCode);
+  }
+  const [rows] = await pool.execute(`SELECT * FROM shifts WHERE ${where.join(' OR ')} LIMIT 1`, params);
+  return rows[0];
+}
+
+function buildShiftWindow(baseDateStr, shift) {
+  if (!shift || !shift.start_time || !shift.end_time) return null;
+
+  const parseTime = (timeStr) => {
+    if (!timeStr) return null;
+    const parts = timeStr.trim().split(':').map((p) => parseInt(p, 10));
+    const [hour, minute = 0, second = 0] = parts;
+    const valid =
+      Number.isFinite(hour) && hour >= 0 && hour <= 23 &&
+      Number.isFinite(minute) && minute >= 0 && minute <= 59 &&
+      Number.isFinite(second) && second >= 0 && second <= 59;
+    if (!valid) return null;
+    return { hour, minute, second };
+  };
+
+  const startParts = parseTime(shift.start_time);
+  const endParts = parseTime(shift.end_time);
+  if (!startParts || !endParts) return null;
+
+  const start = moment.tz(baseDateStr, 'YYYY-MM-DD', TIMEZONE).set({
+    hour: startParts.hour,
+    minute: startParts.minute,
+    second: startParts.second,
+    millisecond: 0,
+  });
+  let end = moment.tz(baseDateStr, 'YYYY-MM-DD', TIMEZONE).set({
+    hour: endParts.hour,
+    minute: endParts.minute,
+    second: endParts.second,
+    millisecond: 0,
+  });
+
+  // Overnight shift: end before start means next day
+  if (end.isSameOrBefore(start)) {
+    end = end.add(1, 'day');
+  }
+  return { start, end };
+}
 
 async function getActiveOfficeLocation() {
   const [rows] = await pool.execute('SELECT latitude, longitude, radius FROM office_location WHERE is_active = 1 LIMIT 1');
@@ -27,7 +83,7 @@ async function savePhoto(file, userId, date, label) {
 const checkIn = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { latitude, longitude, reason } = req.body;
+    const { latitude, longitude, reason, shift_id: shiftIdBody, shift_code: shiftCodeBody } = req.body;
     const photo = req.file;
 
     // Validate input
@@ -36,6 +92,12 @@ const checkIn = async (req, res) => {
         success: false,
         error: 'Latitude and longitude are required',
       });
+    }
+
+    // Require shift selection
+    const shift = await findShift({ shiftId: shiftIdBody, shiftCode: shiftCodeBody });
+    if (!shift) {
+      return res.status(400).json({ success: false, error: 'Shift is required and must be valid' });
     }
 
     if (!photo) {
@@ -75,8 +137,36 @@ const checkIn = async (req, res) => {
     }
 
     // Use server time in GMT+8 timezone - CANNOT BE MANIPULATED BY CLIENT!
-    const now = getCurrentTimeGMT8().toDate();
-    const isLate = isLateCheckIn(now);
+    const nowMoment = getCurrentTimeGMT8();
+
+    // Determine lateness based on shift window; fallback to legacy if missing
+    let isLate = false;
+    const window = buildShiftWindow(today, shift);
+    if (window) {
+      isLate = nowMoment.isAfter(window.start);
+    } else {
+      // Fallback to legacy hours when shift time is missing/invalid
+      console.warn('checkIn shift window missing, using legacy hours', {
+        shiftId: shift.id,
+        shiftCode: shift.code,
+        shiftStart: shift.start_time,
+        shiftEnd: shift.end_time,
+        baseDate: today,
+      });
+      isLate = isLateCheckIn(nowMoment.toDate());
+    }
+
+    console.log('checkIn timing debug', {
+      now: nowMoment.format(),
+      baseDate: today,
+      shiftId: shift.id,
+      shiftCode: shift.code,
+      shiftStart: shift.start_time,
+      shiftEnd: shift.end_time,
+      windowStart: window?.start?.format(),
+      windowEnd: window?.end?.format(),
+      isLate,
+    });
 
     // Validate reason if late
     if (isLate && (!reason || reason.trim() === '')) {
@@ -91,9 +181,22 @@ const checkIn = async (req, res) => {
 
     const [insertResult] = await pool.execute(
       `INSERT INTO attendance
-        (user_id, date, status, check_in_time, check_in_photo_url, check_in_latitude, check_in_longitude, check_in_reason, is_late, is_early)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-      [userId, today, status, now, saved.publicPath, userLat, userLon, isLate ? reason : null, isLate ? 1 : 0]
+        (user_id, date, status, check_in_time, check_in_photo_url, check_in_latitude, check_in_longitude, check_in_reason, is_late, is_early, shift_id, shift_code, shift_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+      [
+        userId,
+        today,
+        status,
+        nowMoment.toDate(),
+        saved.publicPath,
+        userLat,
+        userLon,
+        isLate ? reason : null,
+        isLate ? 1 : 0,
+        shift.id,
+        shift.code,
+        shift.name,
+      ]
     );
 
     const insertedId = insertResult.insertId;
@@ -161,23 +264,73 @@ const checkOut = async (req, res) => {
     }
 
     const today = getTodayDate();
-    const [attendanceRows] = await pool.execute(
-      'SELECT * FROM attendance WHERE user_id = ? AND date = ? LIMIT 1',
+    const nowMoment = getCurrentTimeGMT8();
+
+    // Fetch today's attendance first
+    let [attendanceRows] = await pool.execute(
+      `SELECT a.*, s.start_time AS shift_start_time, s.end_time AS shift_end_time, s.code AS shift_code_ref, s.name AS shift_name_ref
+       FROM attendance a
+       LEFT JOIN shifts s ON a.shift_id = s.id
+       WHERE a.user_id = ? AND a.date = ?
+       LIMIT 1`,
       [userId, today]
     );
 
-    const attendance = attendanceRows[0];
+    let attendance = attendanceRows[0];
+
+    // If none today, allow overnight: look at yesterday's open check-in whose shift window includes now
     if (!attendance) {
-      return res.status(400).json({ success: false, error: 'No check-in record found for today' });
+      const yesterday = nowMoment.clone().subtract(1, 'day').format('YYYY-MM-DD');
+      const [yesterdayRows] = await pool.execute(
+        `SELECT a.*, s.start_time AS shift_start_time, s.end_time AS shift_end_time, s.code AS shift_code_ref, s.name AS shift_name_ref
+         FROM attendance a
+         LEFT JOIN shifts s ON a.shift_id = s.id
+         WHERE a.user_id = ? AND a.date = ? AND a.check_out_time IS NULL
+         ORDER BY a.id DESC
+         LIMIT 1`,
+        [userId, yesterday]
+      );
+
+      const candidate = yesterdayRows[0];
+      if (candidate) {
+        // Verify now is still within the shift window to prevent mismatched days
+        let candidateShift = null;
+        if (candidate.shift_id || candidate.shift_code) {
+          candidateShift = await findShift({ shiftId: candidate.shift_id, shiftCode: candidate.shift_code });
+        }
+        const window = candidateShift ? buildShiftWindow(candidate.date, candidateShift) : null;
+        if (window && nowMoment.isSameOrBefore(window.end)) {
+          attendance = candidate;
+          attendance.shift_start_time = candidate.shift_start_time;
+          attendance.shift_end_time = candidate.shift_end_time;
+          attendance.shift_code_ref = candidate.shift_code_ref;
+          attendance.shift_name_ref = candidate.shift_name_ref;
+        }
+      }
+    }
+
+    if (!attendance) {
+      return res.status(400).json({ success: false, error: 'No check-in record found for current shift window' });
     }
 
     if (attendance.check_out_time) {
-      return res.status(400).json({ success: false, error: 'Already checked out today' });
+      return res.status(400).json({ success: false, error: 'Already checked out for this attendance' });
     }
 
-    // Use server time in GMT+8 timezone - CANNOT BE MANIPULATED BY CLIENT!
-    const now = getCurrentTimeGMT8().toDate();
-    const isEarly = isEarlyCheckOut(now);
+    // Determine early based on shift window (base on attendance date to handle overnight)
+    let isEarly = false;
+    let window = null;
+    if (attendance.shift_id || attendance.shift_code) {
+      const shift = await findShift({ shiftId: attendance.shift_id, shiftCode: attendance.shift_code });
+      if (shift) {
+        window = buildShiftWindow(attendance.date, shift);
+      }
+    }
+    if (window) {
+      isEarly = nowMoment.isBefore(window.end);
+    } else {
+      isEarly = isEarlyCheckOut(nowMoment.toDate());
+    }
 
     // Validate reason if early
     if (isEarly && (!reason || reason.trim() === '')) {
@@ -204,7 +357,7 @@ const checkOut = async (req, res) => {
         is_early = ?
        WHERE id = ?`,
       [
-        now,
+        nowMoment.toDate(),
         saved.publicPath,
         userLat,
         userLon,

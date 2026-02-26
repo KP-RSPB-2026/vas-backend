@@ -7,6 +7,7 @@ function getCurrentTimeGMT8() {
   return moment().tz(TIMEZONE);
 }
 
+// Legacy helpers retained for fallback when shift is unavailable
 function isLateCheckIn(checkInTime) {
   const time = moment(checkInTime).tz(TIMEZONE);
   const hour = time.hours();

@@ -3,6 +3,7 @@ const authRoutes = require('./auth');
 const locationRoutes = require('./location');
 const attendanceRoutes = require('./attendance');
 const userRoutes = require('./users');
+const shiftRoutes = require('./shifts');
 
 const router = express.Router();
 
@@ -20,5 +21,6 @@ router.use('/auth', authRoutes);
 router.use('/location', locationRoutes);
 router.use('/attendance', attendanceRoutes);
 router.use('/users', userRoutes);
+router.use('/shifts', shiftRoutes);
 
 module.exports = router;
